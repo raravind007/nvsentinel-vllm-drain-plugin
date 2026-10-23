@@ -151,7 +151,7 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 
-	for _, code := range strings.Split(os.Getenv("FATAL_ERROR_CODES"), ",") {
+	for code := range strings.SplitSeq(os.Getenv("FATAL_ERROR_CODES"), ",") {
 		code = strings.TrimSpace(code)
 		if code != "" {
 			cfg.FatalErrorCodes[code] = true

@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -72,8 +71,6 @@ type DrainRequestReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
 
 func (r *DrainRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
 	dr := &nvsentinelv1alpha1.DrainRequest{}
 	if err := r.Get(ctx, req.NamespacedName, dr); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -99,7 +96,7 @@ func (r *DrainRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	if allGone {
-		return r.complete(ctx, dr, log)
+		return r.complete(ctx, dr)
 	}
 
 	// dr.Spec.IsFatal is NVSentinel's own classification of the triggering fault
@@ -109,10 +106,10 @@ func (r *DrainRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	deadlineExceeded := time.Since(dr.Status.DrainStartTime.Time) >= r.Config.QuiesceDeadline
 
 	if fatal || deadlineExceeded {
-		return r.forceDrain(ctx, dr, pods, fatal, log)
+		return r.forceDrain(ctx, dr, pods, fatal)
 	}
 
-	return r.gracefulDrain(ctx, dr, pods, log)
+	return r.gracefulDrain(ctx, dr, pods)
 }
 
 // listTargetPods fetches every pod spec.podsToDrain still names. Only a
@@ -157,11 +154,12 @@ func (r *DrainRequestReconciler) listTargetPods(
 // in Terminating: on a genuinely unresponsive node, kubelet may never
 // acknowledge the deletion regardless of finalizers — the same fundamental
 // limitation NVSentinel's own node-drainer has.
-func (r *DrainRequestReconciler) handleStuckTerminating(ctx context.Context, pod *corev1.Pod, log logr.Logger) {
+func (r *DrainRequestReconciler) handleStuckTerminating(ctx context.Context, pod *corev1.Pod) {
 	if time.Since(pod.DeletionTimestamp.Time) < r.Config.StuckTerminatingTimeout {
 		return
 	}
 
+	log := logf.FromContext(ctx)
 	key := podKey(pod.Namespace, pod.Name)
 	stuckFor := time.Since(pod.DeletionTimestamp.Time)
 
@@ -188,8 +186,9 @@ func (r *DrainRequestReconciler) handleStuckTerminating(ctx context.Context, pod
 // read zero across ConfirmWindow, and evicts it through the Eviction API
 // (respecting any PodDisruptionBudget) once confirmed.
 func (r *DrainRequestReconciler) gracefulDrain(
-	ctx context.Context, dr *nvsentinelv1alpha1.DrainRequest, pods []corev1.Pod, log logr.Logger,
+	ctx context.Context, dr *nvsentinelv1alpha1.DrainRequest, pods []corev1.Pod,
 ) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
 	metricsClient := vllmmetrics.NewClient(r.Config.MetricsPort, r.Config.MetricsPath, r.Config.MetricsTimeout)
 	quiescedByKey := indexQuiesced(dr.Status.QuiescedPods)
 
@@ -202,7 +201,7 @@ func (r *DrainRequestReconciler) gracefulDrain(
 		key := podKey(pod.Namespace, pod.Name)
 
 		if !pod.DeletionTimestamp.IsZero() {
-			r.handleStuckTerminating(ctx, pod, log)
+			r.handleStuckTerminating(ctx, pod)
 			continue // already evicted last pass and terminating; wait for it to disappear (or get unstuck above)
 		}
 
@@ -299,13 +298,15 @@ func (r *DrainRequestReconciler) gracefulDrain(
 // gone — including pods this call just deleted, which is why a forced drain
 // typically spans more than one reconcile.
 func (r *DrainRequestReconciler) forceDrain(
-	ctx context.Context, dr *nvsentinelv1alpha1.DrainRequest, pods []corev1.Pod, fatal bool, log logr.Logger,
+	ctx context.Context, dr *nvsentinelv1alpha1.DrainRequest, pods []corev1.Pod, fatal bool,
 ) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
 	for i := range pods {
 		pod := &pods[i]
 
 		if !pod.DeletionTimestamp.IsZero() {
-			r.handleStuckTerminating(ctx, pod, log)
+			r.handleStuckTerminating(ctx, pod)
 			continue // deletion already requested; wait for it (or get unstuck above)
 		}
 
@@ -347,8 +348,9 @@ func (r *DrainRequestReconciler) forceDrain(
 // the CR (and any event/log reading it) even though node-drainer itself only
 // cares about the boolean.
 func (r *DrainRequestReconciler) complete(
-	ctx context.Context, dr *nvsentinelv1alpha1.DrainRequest, log logr.Logger,
+	ctx context.Context, dr *nvsentinelv1alpha1.DrainRequest,
 ) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
 	reason, message := "GracefulDrainComplete", "all target pods were confirmed idle before eviction"
 
 	if dr.Status.Forced {

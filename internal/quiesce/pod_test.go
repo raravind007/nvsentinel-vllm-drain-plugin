@@ -58,7 +58,7 @@ func TestEvictBlockedByPDBIsNotAnError(t *testing.T) {
 		WithInterceptorFuncs(interceptor.Funcs{
 			SubResourceCreate: func(_ context.Context, _ client.Client, subResourceName string,
 				_ client.Object, _ client.Object, _ ...client.SubResourceCreateOption) error {
-				if subResourceName == "eviction" {
+				if subResourceName == evictionSubResource {
 					return blocked
 				}
 
@@ -83,7 +83,7 @@ func TestEvictAlreadyGoneCountsAsEvicted(t *testing.T) {
 		WithInterceptorFuncs(interceptor.Funcs{
 			SubResourceCreate: func(_ context.Context, _ client.Client, subResourceName string,
 				_ client.Object, _ client.Object, _ ...client.SubResourceCreateOption) error {
-				if subResourceName == "eviction" {
+				if subResourceName == evictionSubResource {
 					return apierrors.NewNotFound(podGVR().GroupResource(), "p")
 				}
 
@@ -108,7 +108,7 @@ func TestEvictOtherErrorsPropagate(t *testing.T) {
 		WithInterceptorFuncs(interceptor.Funcs{
 			SubResourceCreate: func(_ context.Context, _ client.Client, subResourceName string,
 				_ client.Object, _ client.Object, _ ...client.SubResourceCreateOption) error {
-				if subResourceName == "eviction" {
+				if subResourceName == evictionSubResource {
 					return apierrors.NewInternalError(context.DeadlineExceeded)
 				}
 

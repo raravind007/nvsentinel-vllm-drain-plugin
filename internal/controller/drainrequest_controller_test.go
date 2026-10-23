@@ -43,6 +43,17 @@ import (
 // fatal fault skipping quiescing entirely, and a simulated controller restart
 // not resetting the deadline clock.
 
+// testMetricsPath is every reconciler Config literal's MetricsPath in this file.
+const testMetricsPath = "/metrics"
+
+// testNamespace and testPodIP are fixed across every test in this file: a
+// single envtest API server with no real networking means there's no
+// variation to exercise by parameterizing either one.
+const (
+	testNamespace = "default"
+	testPodIP     = "127.0.0.1"
+)
+
 func zeroGracePeriod() *int64 {
 	v := int64(0)
 	return &v
@@ -55,8 +66,8 @@ func zeroGracePeriod() *int64 {
 // readiness gate, matching the precondition documented on
 // quiesce.DrainReadyConditionType; use newTestPodWithoutReadinessGate to
 // exercise a workload that doesn't meet that precondition.
-func newTestPod(namespace, name string, labels map[string]string) *corev1.Pod {
-	pod := newTestPodWithoutReadinessGate(namespace, name, labels)
+func newTestPod(name string) *corev1.Pod {
+	pod := newTestPodWithoutReadinessGate(name)
 	pod.Spec.ReadinessGates = []corev1.PodReadinessGate{
 		{ConditionType: corev1.PodConditionType(quiesce.DrainReadyConditionType)},
 	}
@@ -64,9 +75,9 @@ func newTestPod(namespace, name string, labels map[string]string) *corev1.Pod {
 	return pod
 }
 
-func newTestPodWithoutReadinessGate(namespace, name string, labels map[string]string) *corev1.Pod {
+func newTestPodWithoutReadinessGate(name string) *corev1.Pod {
 	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: labels},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
 		Spec: corev1.PodSpec{
 			TerminationGracePeriodSeconds: zeroGracePeriod(),
 			Containers: []corev1.Container{{
@@ -77,8 +88,8 @@ func newTestPodWithoutReadinessGate(namespace, name string, labels map[string]st
 	}
 }
 
-func setPodIP(ctx context.Context, pod *corev1.Pod, ip string) {
-	pod.Status.PodIP = ip
+func setPodIP(ctx context.Context, pod *corev1.Pod) {
+	pod.Status.PodIP = testPodIP
 	pod.Status.Phase = corev1.PodRunning
 	ExpectWithOffset(1, k8sClient.Status().Update(ctx, pod)).To(Succeed())
 }
@@ -87,7 +98,7 @@ func setPodIP(ctx context.Context, pod *corev1.Pod, ip string) {
 // real vLLM pod's /metrics endpoint.
 func fakeVLLMMetrics(running, waiting float64) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprintf(w, "vllm:num_requests_running %v\nvllm:num_requests_waiting %v\n", running, waiting)
+		_, _ = fmt.Fprintf(w, "vllm:num_requests_running %v\nvllm:num_requests_waiting %v\n", running, waiting)
 	}))
 }
 
@@ -119,23 +130,21 @@ func reconcileUntilComplete(r *DrainRequestReconciler, key types.NamespacedName)
 }
 
 var _ = Describe("DrainRequest Controller", func() {
-	const namespace = "default"
-
 	It("evicts a quiesced pod and reports a graceful completion", func() {
 		podName, drainName := "graceful-vllm-pod", "graceful-drain"
 
 		metrics := fakeVLLMMetrics(0, 0) // idle from the start: nothing to wait out but the confirm window
 		defer metrics.Close()
 
-		pod := newTestPod(namespace, podName, nil)
+		pod := newTestPod(podName)
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-		setPodIP(ctx, pod, "127.0.0.1")
+		setPodIP(ctx, pod)
 
 		dr := &nvsentinelv1alpha1.DrainRequest{
-			ObjectMeta: metav1.ObjectMeta{Name: drainName, Namespace: namespace},
+			ObjectMeta: metav1.ObjectMeta{Name: drainName, Namespace: testNamespace},
 			Spec: nvsentinelv1alpha1.DrainRequestSpec{
 				NodeName:    "node-a",
-				PodsToDrain: map[string][]string{namespace: {podName}},
+				PodsToDrain: map[string][]string{testNamespace: {podName}},
 			},
 		}
 		Expect(k8sClient.Create(ctx, dr)).To(Succeed())
@@ -145,7 +154,7 @@ var _ = Describe("DrainRequest Controller", func() {
 			Scheme: k8sClient.Scheme(),
 			Config: Config{
 				MetricsPort:             serverPort(metrics),
-				MetricsPath:             "/metrics",
+				MetricsPath:             testMetricsPath,
 				MetricsTimeout:          time.Second,
 				QuiesceDeadline:         time.Minute,
 				PollInterval:            10 * time.Millisecond,
@@ -156,7 +165,7 @@ var _ = Describe("DrainRequest Controller", func() {
 			},
 		}
 
-		final := reconcileUntilComplete(reconciler, types.NamespacedName{Name: drainName, Namespace: namespace})
+		final := reconcileUntilComplete(reconciler, types.NamespacedName{Name: drainName, Namespace: testNamespace})
 
 		Expect(final.Status.Forced).To(BeFalse())
 		Expect(meta.IsStatusConditionTrue(final.Status.Conditions, quiesceCompleteConditionType)).To(BeTrue())
@@ -171,26 +180,26 @@ var _ = Describe("DrainRequest Controller", func() {
 		metrics := fakeVLLMMetrics(1, 0) // never idle: this test only checks the routing-misconfiguration signal
 		defer metrics.Close()
 
-		pod := newTestPodWithoutReadinessGate(namespace, podName, nil)
+		pod := newTestPodWithoutReadinessGate(podName)
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-		setPodIP(ctx, pod, "127.0.0.1")
+		setPodIP(ctx, pod)
 
 		dr := &nvsentinelv1alpha1.DrainRequest{
-			ObjectMeta: metav1.ObjectMeta{Name: drainName, Namespace: namespace},
+			ObjectMeta: metav1.ObjectMeta{Name: drainName, Namespace: testNamespace},
 			Spec: nvsentinelv1alpha1.DrainRequestSpec{
 				NodeName:    "node-e",
-				PodsToDrain: map[string][]string{namespace: {podName}},
+				PodsToDrain: map[string][]string{testNamespace: {podName}},
 			},
 		}
 		Expect(k8sClient.Create(ctx, dr)).To(Succeed())
 
-		key := types.NamespacedName{Name: drainName, Namespace: namespace}
+		key := types.NamespacedName{Name: drainName, Namespace: testNamespace}
 		reconciler := &DrainRequestReconciler{
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 			Config: Config{
 				MetricsPort:             serverPort(metrics),
-				MetricsPath:             "/metrics",
+				MetricsPath:             testMetricsPath,
 				MetricsTimeout:          time.Second,
 				QuiesceDeadline:         time.Hour,
 				PollInterval:            10 * time.Millisecond,
@@ -228,26 +237,26 @@ var _ = Describe("DrainRequest Controller", func() {
 	It("force-deletes pods once the quiesce deadline passes", func() {
 		podName, drainName := "timeout-vllm-pod", "timeout-drain"
 
-		pod := newTestPod(namespace, podName, nil)
+		pod := newTestPod(podName)
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-		setPodIP(ctx, pod, "127.0.0.1") // nothing listens on the configured metrics port below
+		setPodIP(ctx, pod) // nothing listens on the configured metrics port below
 
 		dr := &nvsentinelv1alpha1.DrainRequest{
-			ObjectMeta: metav1.ObjectMeta{Name: drainName, Namespace: namespace},
+			ObjectMeta: metav1.ObjectMeta{Name: drainName, Namespace: testNamespace},
 			Spec: nvsentinelv1alpha1.DrainRequestSpec{
 				NodeName:    "node-b",
-				PodsToDrain: map[string][]string{namespace: {podName}},
+				PodsToDrain: map[string][]string{testNamespace: {podName}},
 			},
 		}
 		Expect(k8sClient.Create(ctx, dr)).To(Succeed())
 
-		key := types.NamespacedName{Name: drainName, Namespace: namespace}
+		key := types.NamespacedName{Name: drainName, Namespace: testNamespace}
 		reconciler := &DrainRequestReconciler{
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 			Config: Config{
 				MetricsPort:             1, // every scrape fails: activity is always treated as "still in flight"
-				MetricsPath:             "/metrics",
+				MetricsPath:             testMetricsPath,
 				MetricsTimeout:          50 * time.Millisecond,
 				QuiesceDeadline:         30 * time.Millisecond,
 				PollInterval:            10 * time.Millisecond,
@@ -278,28 +287,28 @@ var _ = Describe("DrainRequest Controller", func() {
 	It("skips quiescing and evicts immediately for a fault configured as fatal", func() {
 		podName, drainName := "fatal-vllm-pod", "fatal-drain"
 
-		pod := newTestPod(namespace, podName, nil)
+		pod := newTestPod(podName)
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-		setPodIP(ctx, pod, "127.0.0.1")
+		setPodIP(ctx, pod)
 
 		dr := &nvsentinelv1alpha1.DrainRequest{
-			ObjectMeta: metav1.ObjectMeta{Name: drainName, Namespace: namespace},
+			ObjectMeta: metav1.ObjectMeta{Name: drainName, Namespace: testNamespace},
 			Spec: nvsentinelv1alpha1.DrainRequestSpec{
 				NodeName:    "node-c",
-				PodsToDrain: map[string][]string{namespace: {podName}},
+				PodsToDrain: map[string][]string{testNamespace: {podName}},
 				IsFatal:     true, // NVSentinel's own classification, not a locally-configured error code
 				ErrorCode:   "95",
 			},
 		}
 		Expect(k8sClient.Create(ctx, dr)).To(Succeed())
 
-		key := types.NamespacedName{Name: drainName, Namespace: namespace}
+		key := types.NamespacedName{Name: drainName, Namespace: testNamespace}
 		reconciler := &DrainRequestReconciler{
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 			Config: Config{
 				MetricsPort:             1,
-				MetricsPath:             "/metrics",
+				MetricsPath:             testMetricsPath,
 				MetricsTimeout:          50 * time.Millisecond,
 				QuiesceDeadline:         time.Hour, // large on purpose: only isFatal should force this, not a deadline
 				PollInterval:            10 * time.Millisecond,
@@ -330,28 +339,28 @@ var _ = Describe("DrainRequest Controller", func() {
 	It("clears finalizers on a pod stuck terminating when explicitly enabled", func() {
 		podName, drainName := "stuck-vllm-pod", "stuck-drain"
 
-		pod := newTestPod(namespace, podName, nil)
+		pod := newTestPod(podName)
 		pod.Finalizers = []string{"example.com/test-finalizer"} // holds the object in etcd after delete
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-		setPodIP(ctx, pod, "127.0.0.1")
+		setPodIP(ctx, pod)
 
 		dr := &nvsentinelv1alpha1.DrainRequest{
-			ObjectMeta: metav1.ObjectMeta{Name: drainName, Namespace: namespace},
+			ObjectMeta: metav1.ObjectMeta{Name: drainName, Namespace: testNamespace},
 			Spec: nvsentinelv1alpha1.DrainRequestSpec{
 				NodeName:    "node-g",
-				PodsToDrain: map[string][]string{namespace: {podName}},
+				PodsToDrain: map[string][]string{testNamespace: {podName}},
 				IsFatal:     true, // force-deletes on the first reconcile; the finalizer is what gets it stuck
 			},
 		}
 		Expect(k8sClient.Create(ctx, dr)).To(Succeed())
 
-		key := types.NamespacedName{Name: drainName, Namespace: namespace}
+		key := types.NamespacedName{Name: drainName, Namespace: testNamespace}
 		reconciler := &DrainRequestReconciler{
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 			Config: Config{
 				MetricsPort:             1,
-				MetricsPath:             "/metrics",
+				MetricsPath:             testMetricsPath,
 				MetricsTimeout:          50 * time.Millisecond,
 				QuiesceDeadline:         time.Hour,
 				PollInterval:            10 * time.Millisecond,
@@ -368,7 +377,7 @@ var _ = Describe("DrainRequest Controller", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		stuck := &corev1.Pod{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, stuck)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: podName}, stuck)).To(Succeed())
 		Expect(stuck.DeletionTimestamp).NotTo(BeNil())
 		Expect(stuck.Finalizers).To(ContainElement("example.com/test-finalizer"))
 
@@ -383,28 +392,28 @@ var _ = Describe("DrainRequest Controller", func() {
 	It("leaves a stuck pod's finalizers alone when ClearStuckFinalizers is disabled (the default)", func() {
 		podName, drainName := "stuck-default-vllm-pod", "stuck-default-drain"
 
-		pod := newTestPod(namespace, podName, nil)
+		pod := newTestPod(podName)
 		pod.Finalizers = []string{"example.com/test-finalizer"}
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-		setPodIP(ctx, pod, "127.0.0.1")
+		setPodIP(ctx, pod)
 
 		dr := &nvsentinelv1alpha1.DrainRequest{
-			ObjectMeta: metav1.ObjectMeta{Name: drainName, Namespace: namespace},
+			ObjectMeta: metav1.ObjectMeta{Name: drainName, Namespace: testNamespace},
 			Spec: nvsentinelv1alpha1.DrainRequestSpec{
 				NodeName:    "node-h",
-				PodsToDrain: map[string][]string{namespace: {podName}},
+				PodsToDrain: map[string][]string{testNamespace: {podName}},
 				IsFatal:     true,
 			},
 		}
 		Expect(k8sClient.Create(ctx, dr)).To(Succeed())
 
-		key := types.NamespacedName{Name: drainName, Namespace: namespace}
+		key := types.NamespacedName{Name: drainName, Namespace: testNamespace}
 		reconciler := &DrainRequestReconciler{
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 			Config: Config{
 				MetricsPort:             1,
-				MetricsPath:             "/metrics",
+				MetricsPath:             testMetricsPath,
 				MetricsTimeout:          50 * time.Millisecond,
 				QuiesceDeadline:         time.Hour,
 				PollInterval:            10 * time.Millisecond,
@@ -427,7 +436,7 @@ var _ = Describe("DrainRequest Controller", func() {
 		// drain must not have been reported complete — disabled-by-default means
 		// the plugin never silently bypasses a finalizer's cleanup guarantee.
 		stuck := &corev1.Pod{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, stuck)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: podName}, stuck)).To(Succeed())
 		Expect(stuck.Finalizers).To(ContainElement("example.com/test-finalizer"))
 
 		current := &nvsentinelv1alpha1.DrainRequest{}
@@ -446,23 +455,23 @@ var _ = Describe("DrainRequest Controller", func() {
 	It("does not reset the quiesce deadline across a simulated controller restart", func() {
 		podName, drainName := "restart-vllm-pod", "restart-drain"
 
-		pod := newTestPod(namespace, podName, nil)
+		pod := newTestPod(podName)
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-		setPodIP(ctx, pod, "127.0.0.1") // never reads idle: the DrainRequest stays in progress for both reconciles
+		setPodIP(ctx, pod) // never reads idle: the DrainRequest stays in progress for both reconciles
 
 		dr := &nvsentinelv1alpha1.DrainRequest{
-			ObjectMeta: metav1.ObjectMeta{Name: drainName, Namespace: namespace},
+			ObjectMeta: metav1.ObjectMeta{Name: drainName, Namespace: testNamespace},
 			Spec: nvsentinelv1alpha1.DrainRequestSpec{
 				NodeName:    "node-d",
-				PodsToDrain: map[string][]string{namespace: {podName}},
+				PodsToDrain: map[string][]string{testNamespace: {podName}},
 			},
 		}
 		Expect(k8sClient.Create(ctx, dr)).To(Succeed())
 
-		key := types.NamespacedName{Name: drainName, Namespace: namespace}
+		key := types.NamespacedName{Name: drainName, Namespace: testNamespace}
 		cfg := Config{
 			MetricsPort:             1,
-			MetricsPath:             "/metrics",
+			MetricsPath:             testMetricsPath,
 			MetricsTimeout:          50 * time.Millisecond,
 			QuiesceDeadline:         time.Hour,
 			PollInterval:            10 * time.Millisecond,

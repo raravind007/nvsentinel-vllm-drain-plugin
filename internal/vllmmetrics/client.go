@@ -92,7 +92,7 @@ func (c *Client) Fetch(ctx context.Context, podIP string) (Activity, error) {
 	if err != nil {
 		return Activity{}, fmt.Errorf("scrape %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return Activity{}, fmt.Errorf("scrape %s: unexpected status %d", url, resp.StatusCode)
@@ -198,11 +198,8 @@ func splitSample(line string) (name string, valueText string, ok bool) {
 // so "vllm:num_requests_running{model_name=\"a\"}" compares equal to
 // "vllm:num_requests_running".
 func baseMetricName(name string) string {
-	if i := strings.IndexByte(name, '{'); i >= 0 {
-		return name[:i]
-	}
-
-	return name
+	base, _, _ := strings.Cut(name, "{")
+	return base
 }
 
 func keys(m map[string]bool) []string {

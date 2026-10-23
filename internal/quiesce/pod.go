@@ -106,6 +106,11 @@ func MarkNotReady(ctx context.Context, c client.Client, pod *corev1.Pod, reason,
 	return nil
 }
 
+// evictionSubResource is the Kubernetes pod subresource name for the
+// Eviction API, shared with this package's tests exercising it via a fake
+// client's SubResourceCreate interceptor.
+const evictionSubResource = "eviction"
+
 // Evict requests graceful termination through the Eviction API, so a
 // PodDisruptionBudget protecting the workload is honored. Returns
 // (evicted=false, nil) when a PDB currently blocks the eviction — distinct
@@ -119,7 +124,7 @@ func Evict(ctx context.Context, c client.Client, pod *corev1.Pod) (evicted bool,
 		},
 	}
 
-	err = c.SubResource("eviction").Create(ctx, pod, eviction)
+	err = c.SubResource(evictionSubResource).Create(ctx, pod, eviction)
 
 	switch {
 	case err == nil:

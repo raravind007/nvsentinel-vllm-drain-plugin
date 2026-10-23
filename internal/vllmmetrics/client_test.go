@@ -32,7 +32,7 @@ func serve(t *testing.T, body string) (host string, port int) {
 	t.Helper()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, body)
+		_, _ = fmt.Fprint(w, body)
 	}))
 	t.Cleanup(srv.Close)
 

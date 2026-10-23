@@ -1,0 +1,34 @@
+# Rendered by NVSentinel's node-drainer into one DrainRequest per health event
+# (see docs/tutorials/writing-a-drain-plugin.md in the NVSentinel repo).
+#
+# isFatal is the field the plugin's severity decision actually depends on: it
+# is HealthEvent.isFatal, the classification NVSentinel's health monitors
+# already made, not something this plugin re-derives. HealthEvent.errorCode is
+# a repeated field (a health event can carry more than one code); only the
+# first is surfaced here, for operator visibility and FatalErrorCodes, not as
+# the severity signal. recommendedAction is a proto enum and renders as its
+# name (e.g. "COMPONENT_RESET").
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-drain-template
+  namespace: nvsentinel
+data:
+  drain-template.yaml: |
+    apiVersion: nvsentinel.nvidia.com/v1alpha1
+    kind: DrainRequest
+    spec:
+      nodeName: {{ .HealthEvent.NodeName }}
+      isFatal: {{ .HealthEvent.IsFatal }}
+      {{- if .HealthEvent.ErrorCode }}
+      errorCode: {{ index .HealthEvent.ErrorCode 0 }}
+      {{- end }}
+      recommendedAction: {{ .HealthEvent.RecommendedAction }}
+      healthEventID: {{ .EventID }}
+      podsToDrain:
+      {{- range $namespace, $pods := .PodsToDrain }}
+        {{ $namespace }}:
+        {{- range $pods }}
+        - {{ . }}
+        {{- end }}
+      {{- end }}

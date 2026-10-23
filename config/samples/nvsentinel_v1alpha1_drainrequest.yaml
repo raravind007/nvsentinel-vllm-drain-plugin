@@ -1,0 +1,16 @@
+apiVersion: nvsentinel.nvidia.com/v1alpha1
+kind: DrainRequest
+metadata:
+  labels:
+    app.kubernetes.io/name: vllm-drain-plugin
+    app.kubernetes.io/managed-by: kustomize
+  name: drainrequest-sample
+spec:
+  nodeName: gpu-node-01
+  podsToDrain:
+    inference:
+      - vllm-llama3-70b-0
+  isFatal: true
+  errorCode: "95"
+  recommendedAction: COMPONENT_RESET
+  healthEventID: 1a2b3c4d

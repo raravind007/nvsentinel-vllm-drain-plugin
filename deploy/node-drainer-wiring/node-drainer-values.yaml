@@ -1,0 +1,35 @@
+# NVSentinel node-drainer Helm values. customDrain hands the drain step for
+# matching nodes to this plugin instead of node-drainer's built-in eviction;
+# see docs/configuration/node-drainer.md#scoping-custom-drain-to-part-of-the-cluster
+# in the NVSentinel repo.
+#
+# nodeSelector below scopes custom drain to GPU inference nodes only, so
+# userNamespaces stays configured for every other node in the cluster.
+node-drainer:
+  userNamespaces:
+    - name: "*"
+      mode: "AllowCompletion"
+
+  customDrain:
+    enabled: true
+    nodeSelector: "workload-type=vllm-inference"
+    templateConfigMapName: "vllm-drain-template"
+    templateMountPath: "/etc/drain-template"
+    templateFileName: "drain-template.yaml"
+    namespace: "nvsentinel"
+    apiGroup: "nvsentinel.nvidia.com"
+    version: "v1alpha1"
+    kind: "DrainRequest"
+    resource: "drainrequests"
+    statusConditionType: "DrainComplete"
+    statusConditionStatus: "True"
+    # MUST exceed the plugin's own worst-case runtime, or node-drainer gives up
+    # waiting on the DrainRequest before the plugin's forced-drain fallback
+    # finishes. Worst case here is QUIESCE_DEADLINE (120s, the plugin's
+    # default) + FORCE_DELETE_GRACE_PERIOD_SECONDS (0s default) + margin for
+    # API latency and the plugin's own poll interval — this value must be kept
+    # in sync by hand if either of those defaults changes. node-drainer's own
+    # timeout is a backstop for the plugin becoming unresponsive, not the
+    # mechanism bounding how long a graceful drain waits for in-flight
+    # requests; that's QUIESCE_DEADLINE, enforced inside the plugin.
+    timeout: "180"

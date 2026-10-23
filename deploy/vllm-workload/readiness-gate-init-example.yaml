@@ -1,0 +1,111 @@
+# CRITICAL PREREQUISITE — read this before adding the drain-ready readinessGate
+# to any pod this plugin targets.
+#
+# Kubernetes treats an absent readiness-gate condition as equivalent to False
+# (https://kubernetes.io/docs/concepts/scheduling-eviction/pod-scheduling-readiness/):
+# a pod whose spec declares
+#
+#   readinessGates:
+#     - conditionType: nvsentinel.nvidia.com/drain-ready
+#
+# can NEVER become Ready — and therefore never receives traffic, never passes
+# a rollout — unless SOMETHING explicitly sets that condition to True first.
+#
+# This plugin (internal/quiesce/pod.go, MarkNotReady) only ever sets this
+# condition to FALSE, during a drain. It never initializes it to True — that
+# is the workload's responsibility, by design: the drain plugin only
+# reconciles DrainRequest objects, not every pod in the cluster, so it cannot
+# be the thing that flips every vLLM pod to Ready at startup.
+#
+# This file is a reference for closing that gap: an initContainer that patches
+# its own pod's status to set drain-ready=True once, before the main vLLM
+# container is considered for scheduling into Service rotation, plus the RBAC
+# it needs. Add the initContainer and the readinessGate to the SAME Deployment
+# — adding one without the other either does nothing (no gate) or makes every
+# pod permanently unready (gate with no initializer).
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vllm-drain-ready-init
+  namespace: inference
+rules:
+  # Scoped to the namespace, not to individual pod names: RBAC can't restrict
+  # "only this pod's own status" for a dynamically-named Pod. Any pod running
+  # as vllm-drain-ready-init can patch any other pod's status in this
+  # namespace. If that's too broad for your threat model, split vLLM into its
+  # own namespace, or replace this with a small sidecar that only ever talks
+  # to the Kubernetes API via the downward API for its own name/namespace and
+  # is reviewed accordingly.
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vllm-drain-ready-init
+  namespace: inference
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: vllm-drain-ready-init
+subjects:
+  - kind: ServiceAccount
+    name: vllm-serving
+    namespace: inference
+---
+# Merge this initContainer and serviceAccountName into your existing vLLM
+# Deployment's pod template — this is not a standalone resource.
+#
+# apiVersion: apps/v1
+# kind: Deployment
+# metadata:
+#   name: vllm-llama3-70b
+#   namespace: inference
+# spec:
+#   template:
+#     spec:
+#       serviceAccountName: vllm-serving
+#       readinessGates:
+#         - conditionType: nvsentinel.nvidia.com/drain-ready
+#       initContainers:
+#         - name: init-drain-ready
+#           # Pin to a kubectl minor version close to your cluster's.
+#           image: bitnami/kubectl:1.31
+#           command:
+#             - sh
+#             - -c
+#             - |
+#               set -eu
+#               # No --type flag: kubectl's default strategic merge patch merges
+#               # the conditions list by its "type" key, so this adds/updates
+#               # only the drain-ready entry and leaves every condition kubelet
+#               # already set (PodScheduled, Initialized, ContainersReady, Ready
+#               # itself) untouched. A plain JSON merge patch (--type=merge)
+#               # would instead REPLACE the whole conditions array — don't use it
+#               # here.
+#               kubectl patch pod "$POD_NAME" --namespace "$POD_NAMESPACE" \
+#                 --subresource=status \
+#                 -p "{\"status\":{\"conditions\":[{\"type\":\"nvsentinel.nvidia.com/drain-ready\",\"status\":\"True\",\"reason\":\"Initialized\",\"message\":\"set by init-drain-ready at pod startup\",\"lastTransitionTime\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}]}}"
+#           env:
+#             - name: POD_NAME
+#               valueFrom: { fieldRef: { fieldPath: metadata.name } }
+#             - name: POD_NAMESPACE
+#               valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+#       containers:
+#         - name: vllm
+#           # ... your existing vLLM container spec, unchanged ...
+#
+# This runs once per pod (initContainers do not re-run on a main-container
+# restart/crash-loop, only when the Pod object itself is recreated), so the
+# condition stays True across the vLLM container's own restarts until this
+# plugin explicitly sets it False during a drain.
+#
+# Residual gap: if a DrainRequest is abandoned mid-drain without the pod ever
+# being evicted (e.g. NVSentinel decides the fault no longer applies), nothing
+# in this reference implementation sets the condition back to True. The pod
+# would stay excluded from routing until deleted. Closing that would need
+# either node-drainer to signal drain cancellation (it doesn't today) or a
+# periodic reconciler re-asserting True for pods with no active DrainRequest
+# naming them — not implemented here.

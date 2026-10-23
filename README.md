@@ -1,0 +1,299 @@
+# vllm-drain-plugin
+
+A reference [NVSentinel drain plugin](https://github.com/NVIDIA/NVSentinel/blob/main/docs/tutorials/writing-a-drain-plugin.md)
+for vLLM serving pods: when NVSentinel detects a GPU fault and needs to drain a node, this
+controller stops routing new requests to the affected vLLM pods, waits for their in-flight
+generations (including streaming responses) to finish, and only then evicts — instead of
+node-drainer's default behavior of evicting on a fixed grace period with no idea whether vLLM
+has active work.
+
+## Description
+
+NVSentinel's node-drainer already has everything needed to coordinate node-level eviction
+(PodDisruptionBudgets, termination grace periods, per-pod drain policies). What it doesn't have,
+and isn't meant to, is any notion of "is this specific inference server done with its requests."
+This plugin fills that gap through NVSentinel's existing `customDrain` extension point: node-drainer
+renders a `DrainRequest` CR per health event and polls its `status.conditions` for
+`DrainComplete=True`; this controller reconciles that CR and decides when it's actually safe to
+say so. **It does not modify node-drainer or any other part of NVSentinel's core.**
+
+On each `DrainRequest`:
+
+1. **Stop routing.** The plugin patches a `nvsentinel.nvidia.com/drain-ready` condition directly onto
+   each target pod's `/status` subresource (no sidecar, no `EndpointSlice` edits that a controller
+   would just reconcile away) — see [`internal/quiesce/pod.go`](internal/quiesce/pod.go). This only
+   removes the pod from a `Service`'s normal routing addresses if the pod's own spec declares it as a
+   [readiness gate](https://kubernetes.io/docs/concepts/scheduling-eviction/pod-scheduling-readiness/)
+   **at pod creation**:
+   ```yaml
+   spec:
+     readinessGates:
+       - conditionType: nvsentinel.nvidia.com/drain-ready
+   ```
+   **This is a precondition on the vLLM Deployment this plugin targets, not something the plugin
+   configures for you.** The controller checks for it (`quiesce.HasReadinessGate`) and reports
+   `RoutingConfigured=False` on the CR when a target pod is missing it, so the gap is visible on the
+   object rather than a silent no-op. Even correctly configured, this only stops *new* requests
+   arriving through ordinary Service routing once the change propagates — it does not terminate a
+   client's existing keep-alive connection to the pod, and it does nothing for a custom inference
+   gateway or Gateway API implementation that doesn't react to pod readiness. Closing that gap needs
+   gateway-specific draining support, which this plugin does not provide.
+
+   > **⚠ Before you declare this readinessGate on anything: Kubernetes treats an *absent* readiness-gate
+   > condition as False.** A pod with this gate declared and nothing ever setting the condition to
+   > True can **never become Ready at all** — not just during a drain, permanently. This plugin only
+   > ever sets the condition to **False**; it does not, and structurally cannot, initialize it to True
+   > for every pod in the cluster (it only reconciles `DrainRequest` objects). Your vLLM workload must
+   > set `nvsentinel.nvidia.com/drain-ready=True` on itself at startup, or it will never pass readiness.
+   > See [`deploy/vllm-workload/readiness-gate-init-example.yaml`](deploy/vllm-workload/readiness-gate-init-example.yaml)
+   > for a working initContainer + RBAC reference that does this.
+2. **Wait for in-flight work.** The plugin scrapes each pod's vLLM `/metrics` endpoint directly
+   (`vllm:num_requests_running` + `vllm:num_requests_waiting`), bypassing Prometheus entirely so
+   this never depends on a monitoring stack being installed or on a scrape-interval staleness
+   window. A pod is only evicted once activity has read zero for a full confirm window (two poll
+   intervals by default), not on a single reading — see
+   [`internal/vllmmetrics/client.go`](internal/vllmmetrics/client.go). This narrows, but does not
+   close, the race with a request arriving right as routing is pulled (see above). An unreachable pod,
+   a non-200 response, or a body with neither metric name recognized in it (empty, truncated, an HTML
+   error page) is always treated as **an error, never as zero activity** — `gracefulDrain` reads any
+   scrape failure as "still active" and keeps waiting, it never interprets "couldn't find out" as
+   "confirmed idle."
+3. **Evict, respecting PodDisruptionBudgets**, via the real Eviction API
+   (`pods/eviction`), once a pod is confirmed idle.
+4. **Force it anyway, deliberately, in two cases:** the quiesce deadline
+   (`QUIESCE_DEADLINE`) passes before every pod goes idle, or the triggering health event's own
+   `isFatal` flag is true (a fatal fault means there may be nothing left to gracefully finish — see
+   "isFatal provenance" below). Both cases bypass the Eviction API and delete directly with an
+   explicit, configurable grace period (`FORCE_DELETE_GRACE_PERIOD_SECONDS`, default 0) rather than
+   whatever the pod spec's own `terminationGracePeriodSeconds` happens to be — otherwise a "forced,
+   bounded" drain could silently run tens of seconds longer than configured. Both cases are recorded
+   on the CR's `QuiesceComplete` condition — `DrainComplete=True` on its own never tells you whether
+   a request was actually interrupted; check `QuiesceComplete` for that. In both cases, the plugin
+   still waits for the pod to actually disappear before reporting `DrainComplete=True`; starting
+   deletion is not the same as completion, for either eviction or force-delete. A grace period alone
+   doesn't guarantee that disappearance, either: once a pod has sat `Terminating` past
+   `STUCK_TERMINATING_TIMEOUT` (default 30s), a finalizer — not the grace period — is almost always
+   what's actually holding the object in etcd. **The plugin only logs this by default; it does not
+   clear the finalizer unless `CLEAR_STUCK_FINALIZERS=true` is explicitly set.** A finalizer exists to
+   guarantee some cleanup completes (a volume detaching, a load balancer deregistering the pod, a
+   custom controller's own bookkeeping) before the object is removed, and clearing it skips that
+   guarantee rather than honoring it — so this is opt-in, not a default behavior, and should only be
+   enabled after auditing what finalizers your vLLM pods actually carry. See `handleStuckTerminating`
+   in [`internal/controller/drainrequest_controller.go`](internal/controller/drainrequest_controller.go).
+
+### isFatal provenance — verify before relying on it
+
+The `HealthEvent` proto NVSentinel passes to the `customDrain` template
+([`health_event.proto`](https://github.com/NVIDIA/NVSentinel/blob/main/data-models/protobufs/health_event.proto))
+has an `isFatal` field, and that's what `DrainRequestSpec.IsFatal` is meant to carry — but the
+upstream tutorial's own documented list of optional `DrainRequest` template context (`checkName`,
+`recommendedAction`, `errorCode`, `healthEventID`, `entitiesImpacted`, `metadata`, `reason`) does not
+mention `isFatal` explicitly. It should still render, since `TemplateData.HealthEvent` is the whole
+proto message, not a curated subset — but this hasn't been confirmed against a running node-drainer,
+only inferred from the proto definition. **Before depending on `isFatal` in production, confirm it
+renders as expected against the `NVSentinel` version you're actually running**, and treat a missing or
+unrendered field as `false` (non-fatal) — which is what the Go zero value already gives you by
+default, not a change you need to make.
+
+See [`internal/controller/drainrequest_controller.go`](internal/controller/drainrequest_controller.go)
+for the full reconcile logic and [`internal/controller/config.go`](internal/controller/config.go) for
+every tunable (`QUIESCE_DEADLINE`, `POLL_INTERVAL`, `CONFIRM_WINDOW`, `VLLM_METRICS_PORT`/`PATH`,
+`FORCE_DELETE_GRACE_PERIOD_SECONDS`, `STUCK_TERMINATING_TIMEOUT`, `CLEAR_STUCK_FINALIZERS` — off by
+default, see above — `FATAL_ERROR_CODES`).
+[`deploy/node-drainer-wiring/`](deploy/node-drainer-wiring/) has the
+NVSentinel-side `customDrain` Helm values and drain-template `ConfigMap` needed to point node-drainer
+at this plugin in production — see the upstream tutorial's
+[§7c](https://github.com/NVIDIA/NVSentinel/blob/main/docs/tutorials/writing-a-drain-plugin.md#7c-verify-the-full-remediation-flow-end-to-end)
+for how to drive it end-to-end with a real injected GPU fault.
+
+### Known limitations (reference implementation, not production-hardened)
+
+- **The readiness-gate initializer is a deployment prerequisite, not something this plugin provides.**
+  See the warning under "Stop routing" above and
+  [`deploy/vllm-workload/readiness-gate-init-example.yaml`](deploy/vllm-workload/readiness-gate-init-example.yaml).
+  Skipping it makes every vLLM pod that declares the gate permanently unready, not just during a drain.
+- **Existing connections and gateways are out of scope.** Marking a pod not-ready stops new
+  Service-routed requests, not traffic over a client's already-open connection or through a
+  readiness-agnostic gateway.
+- **A drain abandoned mid-flight leaves the pod not-ready.** If a `DrainRequest` stops being reconciled
+  toward completion (e.g. node-drainer deletes it without the pod ever being evicted), nothing resets
+  `drain-ready` back to True — see the residual-gap note in the deployment example above.
+- **A single recognized metric name is enough for `vllmmetrics.Fetch` to succeed.** It errors on a
+  response with neither `num_requests_running` nor `num_requests_waiting` in it, but a vLLM version
+  that renamed just one of the two would still parse successfully and silently report that signal as
+  zero.
+- **`node-drainer`'s own `customDrain.timeout` must be configured larger than this plugin's worst-case
+  runtime**, i.e. larger than `QUIESCE_DEADLINE` plus however long a forced deletion with
+  `FORCE_DELETE_GRACE_PERIOD_SECONDS` plus normal API latency takes — otherwise node-drainer can give
+  up waiting on the `DrainRequest` before this plugin's own forced-drain fallback finishes. See
+  [`deploy/node-drainer-wiring/node-drainer-values.yaml`](deploy/node-drainer-wiring/node-drainer-values.yaml).
+- The quiesce deadline currently applies uniformly to every pod in a `DrainRequest`; a mixed batch
+  of a 2-second and a 90-second request both drain against the same clock.
+- `FATAL_ERROR_CODES` is a flat string set; it doesn't distinguish which GPU a multi-GPU pod actually
+  lost versus which codes genuinely mean "nothing more can finish." `isFatal` (see above) is the
+  primary signal and doesn't have this problem, but needs its own provenance verified.
+- No metrics/observability are emitted by the plugin itself beyond the CR's own status — logs and
+  `kubectl get drainrequest -o yaml` are the only visibility today.
+
+### Test coverage
+
+These are controller/API-level integration and unit tests. They do **not** exercise `EndpointSlice`
+or `kube-proxy` routing removal, real `PodDisruptionBudget` admission under load, a Gateway API
+implementation, or live vLLM request/streaming behavior — see "Known limitations" and "isFatal
+provenance" above for what that leaves unverified.
+
+[`internal/controller/drainrequest_controller_test.go`](internal/controller/drainrequest_controller_test.go)
+runs against a real control plane (`envtest`: actual `etcd` + `kube-apiserver`, no mocks — but no
+kubelet, endpoint controller, or disruption controller either) and covers: a successful graceful
+drain, a quiesce deadline forcing eviction, a fatal health event skipping quiescing entirely, a
+simulated controller restart that must not reset the deadline clock, a pod missing the readiness
+gate being flagged via `RoutingConfigured=False`, a pod stuck `Terminating` behind a finalizer having
+that finalizer cleared once `STUCK_TERMINATING_TIMEOUT` passes with `CLEAR_STUCK_FINALIZERS=true`, and
+the same scenario leaving the finalizer untouched with the default `false`. A real `PodDisruptionBudget`
+block was deliberately
+**not** included here after checking empirically: envtest's apiserver permits eviction against an
+unsynced PDB rather than denying it (no disruption controller runs to populate `status`), so a test
+built on a real PDB in this environment would pass regardless of whether `quiesce.Evict`'s blocking
+logic was even correct.
+
+[`internal/quiesce/pod_test.go`](internal/quiesce/pod_test.go) covers that logic instead, with a fake
+client whose interceptors return the actual `TooManyRequests` error a live PDB block produces, plus
+the already-gone and generic-error branches, and that `ForceDelete` sends the grace period it was
+configured with rather than the pod's own default.
+
+[`internal/vllmmetrics/client_test.go`](internal/vllmmetrics/client_test.go) covers the
+Prometheus-text-format parsing, including summing across label sets (a pod serving more than one
+model) and treating an unreachable pod as "unknown," never as "idle."
+
+## Getting Started
+
+### Prerequisites
+- go version v1.24.6+
+- docker version 17.03+.
+- kubectl version v1.11.3+.
+- Access to a Kubernetes v1.11.3+ cluster.
+
+### To Deploy on the cluster
+**Build and push your image to the location specified by `IMG`:**
+
+```sh
+make docker-build docker-push IMG=<some-registry>/vllm-drain-plugin:tag
+```
+
+**NOTE:** This image ought to be published in the personal registry you specified.
+And it is required to have access to pull the image from the working environment.
+Make sure you have the proper permission to the registry if the above commands don’t work.
+
+**Install the CRDs into the cluster:**
+
+```sh
+make install
+```
+
+**Deploy the Manager to the cluster with the image specified by `IMG`:**
+
+```sh
+make deploy IMG=<some-registry>/vllm-drain-plugin:tag
+```
+
+> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
+privileges or be logged in as admin.
+
+**Create instances of your solution**
+You can apply the samples (examples) from the config/sample:
+
+```sh
+kubectl apply -k config/samples/
+```
+
+>**NOTE**: Ensure that the samples has default values to test it out.
+
+### To Uninstall
+**Delete the instances (CRs) from the cluster:**
+
+```sh
+kubectl delete -k config/samples/
+```
+
+**Delete the APIs(CRDs) from the cluster:**
+
+```sh
+make uninstall
+```
+
+**UnDeploy the controller from the cluster:**
+
+```sh
+make undeploy
+```
+
+## Project Distribution
+
+Following the options to release and provide this solution to the users.
+
+### By providing a bundle with all YAML files
+
+1. Build the installer for the image built and published in the registry:
+
+```sh
+make build-installer IMG=<some-registry>/vllm-drain-plugin:tag
+```
+
+**NOTE:** The makefile target mentioned above generates an 'install.yaml'
+file in the dist directory. This file contains all the resources built
+with Kustomize, which are necessary to install this project without its
+dependencies.
+
+2. Using the installer
+
+Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
+the project, i.e.:
+
+```sh
+kubectl apply -f https://raw.githubusercontent.com/<org>/vllm-drain-plugin/<tag or branch>/dist/install.yaml
+```
+
+### By providing a Helm Chart
+
+1. Build the chart using the optional helm plugin
+
+```sh
+kubebuilder edit --plugins=helm/v2-alpha
+```
+
+2. See that a chart was generated under 'dist/chart', and users
+can obtain this solution from there.
+
+**NOTE:** If you change the project, you need to update the Helm Chart
+using the same command above to sync the latest changes. Furthermore,
+if you create webhooks, you need to use the above command with
+the '--force' flag and manually ensure that any custom configuration
+previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
+is manually re-applied afterwards.
+
+## Contributing
+
+This project's Go module is currently `github.com/example/vllm-drain-plugin` — a placeholder.
+Before publishing, rename it (update `go.mod` and every import of
+`github.com/example/vllm-drain-plugin/...`) to wherever it will actually live.
+
+**NOTE:** Run `make help` for more information on all potential `make` targets
+
+More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+
+## License
+
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+

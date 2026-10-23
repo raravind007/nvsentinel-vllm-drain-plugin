@@ -30,7 +30,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/example/vllm-drain-plugin/test/utils"
+	"github.com/raravind007/nvsentinel-vllm-drain-plugin/test/utils"
 )
 
 // namespace where the project is deployed in

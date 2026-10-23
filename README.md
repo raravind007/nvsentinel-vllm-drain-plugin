@@ -54,10 +54,12 @@ On each `DrainRequest`:
    intervals by default), not on a single reading — see
    [`internal/vllmmetrics/client.go`](internal/vllmmetrics/client.go). This narrows, but does not
    close, the race with a request arriving right as routing is pulled (see above). An unreachable pod,
-   a non-200 response, or a body with neither metric name recognized in it (empty, truncated, an HTML
-   error page) is always treated as **an error, never as zero activity** — `gracefulDrain` reads any
-   scrape failure as "still active" and keeps waiting, it never interprets "couldn't find out" as
-   "confirmed idle."
+   a non-200 response, a body missing *either* expected metric name (exact match after stripping
+   labels, not substring matching), or a sample that's negative, `NaN`, or infinite is always treated
+   as **an error, never as zero or partial activity** — `gracefulDrain` reads any scrape failure as
+   "still active" and keeps waiting, it never interprets "couldn't find out" as "confirmed idle."
+   Both metrics are required specifically so a vLLM version that renames or drops just one of them
+   fails the scrape instead of silently reporting that one signal as zero.
 3. **Evict, respecting PodDisruptionBudgets**, via the real Eviction API
    (`pods/eviction`), once a pod is confirmed idle.
 4. **Force it anyway, deliberately, in two cases:** the quiesce deadline
@@ -118,10 +120,6 @@ for how to drive it end-to-end with a real injected GPU fault.
 - **A drain abandoned mid-flight leaves the pod not-ready.** If a `DrainRequest` stops being reconciled
   toward completion (e.g. node-drainer deletes it without the pod ever being evicted), nothing resets
   `drain-ready` back to True — see the residual-gap note in the deployment example above.
-- **A single recognized metric name is enough for `vllmmetrics.Fetch` to succeed.** It errors on a
-  response with neither `num_requests_running` nor `num_requests_waiting` in it, but a vLLM version
-  that renamed just one of the two would still parse successfully and silently report that signal as
-  zero.
 - **`node-drainer`'s own `customDrain.timeout` must be configured larger than this plugin's worst-case
   runtime**, i.e. larger than `QUIESCE_DEADLINE` plus however long a forced deletion with
   `FORCE_DELETE_GRACE_PERIOD_SECONDS` plus normal API latency takes — otherwise node-drainer can give
@@ -134,6 +132,25 @@ for how to drive it end-to-end with a real injected GPU fault.
   primary signal and doesn't have this problem, but needs its own provenance verified.
 - No metrics/observability are emitted by the plugin itself beyond the CR's own status — logs and
   `kubectl get drainrequest -o yaml` are the only visibility today.
+
+### Tracked, not yet implemented
+
+Flagged in review and deliberately left for a follow-up rather than bundled into a single large change:
+
+- `ClearFinalizers` (see `internal/quiesce/pod.go`) removes every finalizer on a stuck pod; an explicit
+  allowlist of finalizer names, in addition to the existing `CLEAR_STUCK_FINALIZERS` opt-in, would
+  narrow this further.
+- The vLLM `/metrics` scrape goes over the pod IP directly; this hasn't been validated against a
+  `NetworkPolicy` that would block it, and the client doesn't yet handle IPv6 pod addresses explicitly.
+- The readiness-gate initializer example grants `pods/status` patch at the namespace level (see
+  [`deploy/vllm-workload/readiness-gate-init-example.yaml`](deploy/vllm-workload/readiness-gate-init-example.yaml)
+  for why RBAC can't scope it tighter to "only this pod"); a dedicated controller rather than an
+  initContainer would be preferable for stricter environments.
+- `Config` (see `internal/controller/config.go`) doesn't reject zero/negative durations or invalid
+  port numbers at startup — a misconfigured value currently fails at use rather than at boot.
+- The readiness-gate initializer in the deployment example is one-shot; recovering a pod left
+  `drain-ready=False` by an abandoned drain (see the limitation above) would need a periodic
+  reconciler, not implemented here.
 
 ### Test coverage
 
@@ -162,18 +179,28 @@ the already-gone and generic-error branches, and that `ForceDelete` sends the gr
 configured with rather than the pod's own default.
 
 [`internal/vllmmetrics/client_test.go`](internal/vllmmetrics/client_test.go) covers the
-Prometheus-text-format parsing, including summing across label sets (a pod serving more than one
-model) and treating an unreachable pod as "unknown," never as "idle."
+Prometheus-text-format parsing: summing across label sets (a pod serving more than one model),
+treating an unreachable pod or a malformed body as "unknown" rather than "idle," rejecting a response
+missing either expected metric, rejecting negative and non-finite values, and exact-name matching (a
+metric whose name merely contains `num_requests_running` as a substring is not mistaken for it).
 
 ## Getting Started
 
 ### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+- go version v1.26+ (matches `go.mod`)
+- docker, for building the controller image
+- kubectl, matching your cluster's version
+- Access to a Kubernetes 1.22+ cluster — this plugin relies on the `policy/v1` Eviction subresource
+  (stable since 1.22) and pod readiness gates (stable since 1.14). Tested via `envtest` against 1.37.0;
+  see [Test coverage](#test-coverage) for exactly what that does and doesn't verify.
 
 ### To Deploy on the cluster
+
+> This deploys the drain-plugin controller itself. It does not by itself wire NVSentinel's
+> node-drainer to use it (see [`deploy/node-drainer-wiring/`](deploy/node-drainer-wiring/)) or prepare
+> a vLLM workload to be drained by it (see [`deploy/vllm-workload/`](deploy/vllm-workload/), and
+> read the readiness-gate warning under "Stop routing" above first).
+
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
@@ -273,9 +300,9 @@ is manually re-applied afterwards.
 
 ## Contributing
 
-This project's Go module is currently `github.com/example/vllm-drain-plugin` — a placeholder.
-Before publishing, rename it (update `go.mod` and every import of
-`github.com/example/vllm-drain-plugin/...`) to wherever it will actually live.
+Issues and PRs against this repository are welcome. See
+[NVIDIA/NVSentinel#2124](https://github.com/NVIDIA/NVSentinel/issues/2124) for the upstream proposal
+this reference implementation accompanies.
 
 **NOTE:** Run `make help` for more information on all potential `make` targets
 

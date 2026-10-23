@@ -7,7 +7,7 @@ domain: nvidia.com
 layout:
 - go.kubebuilder.io/v4
 projectName: vllm-drain-plugin
-repo: github.com/example/vllm-drain-plugin
+repo: github.com/raravind007/nvsentinel-vllm-drain-plugin
 resources:
 - api:
     crdVersion: v1
@@ -16,6 +16,6 @@ resources:
   domain: nvidia.com
   group: nvsentinel
   kind: DrainRequest
-  path: github.com/example/vllm-drain-plugin/api/v1alpha1
+  path: github.com/raravind007/nvsentinel-vllm-drain-plugin/api/v1alpha1
   version: v1alpha1
 version: "3"

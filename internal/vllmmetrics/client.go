@@ -26,6 +26,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -70,15 +71,15 @@ func NewClient(port int, path string, timeout time.Duration) *Client {
 // across every label combination vLLM exposes (e.g. per served model), since
 // a pod serving more than one model would otherwise only report one series.
 //
-// An unreachable pod, a non-200 response, or a body with neither recognized
-// metric name in it (empty, truncated, an HTML error page, or a vLLM version
-// that renamed both) all return an error rather than a zero Activity — the
-// caller must not treat a failed or malformed scrape as "idle": see
+// This fails closed: an unreachable pod, a non-200 response, a body missing
+// either expected metric name, or a sample whose value is negative, NaN, or
+// infinite all return an error rather than a zero or partial Activity. The
+// caller must not treat a failed or rejected scrape as "idle" — see
 // drainrequest_controller.go's gracefulDrain, which treats any Fetch error as
-// "still active," never as evidence of zero in-flight requests. This cannot
-// catch every malformed-data case: if only one of the two metric names is
-// recognized in the response (e.g. a future vLLM version renames just one),
-// Fetch still succeeds and silently reports that one signal as zero.
+// "still active," never as evidence of zero in-flight requests. Requiring
+// both metrics (rather than either one) specifically closes the gap where a
+// vLLM version renames or drops just one of them: that used to silently read
+// as that signal being zero, and now fails the scrape instead.
 func (c *Client) Fetch(ctx context.Context, podIP string) (Activity, error) {
 	url := fmt.Sprintf("http://%s:%d%s", podIP, c.Port, c.Path)
 
@@ -100,19 +101,21 @@ func (c *Client) Fetch(ctx context.Context, podIP string) (Activity, error) {
 	return parse(resp.Body)
 }
 
-// Prometheus exposition format: "metric_name{label=\"value\",...} 1.0" or
-// "metric_name 1.0", one sample per line; comment lines start with "#".
 // vLLM renamed its metrics across versions (e.g. a "vllm:" prefix was added,
-// then versions also shipped without it) so both are matched.
-const (
-	runningMetric = "num_requests_running"
-	waitingMetric = "num_requests_waiting"
+// then versions also shipped without it), so each signal accepts either exact
+// name — exact equality against the metric name with any label block
+// stripped, not a substring match, so an unrelated metric that merely
+// contains "num_requests_running" as part of a longer name is never mistaken
+// for it.
+var (
+	runningMetricNames = map[string]bool{"vllm:num_requests_running": true, "num_requests_running": true}
+	waitingMetricNames = map[string]bool{"vllm:num_requests_waiting": true, "num_requests_waiting": true}
 )
 
 func parse(body io.Reader) (Activity, error) {
 	var activity Activity
 
-	foundAnySample := false
+	var foundRunning, foundWaiting bool
 
 	scanner := bufio.NewScanner(body)
 	for scanner.Scan() {
@@ -121,50 +124,92 @@ func parse(body io.Reader) (Activity, error) {
 			continue
 		}
 
-		name, value, ok := splitSample(line)
+		name, valueText, ok := splitSample(line)
 		if !ok {
 			continue
 		}
 
+		base := baseMetricName(name)
+
+		var target *float64
+
 		switch {
-		case strings.Contains(name, runningMetric):
-			activity.Running += value
-			foundAnySample = true
-		case strings.Contains(name, waitingMetric):
-			activity.Waiting += value
-			foundAnySample = true
+		case runningMetricNames[base]:
+			target, foundRunning = &activity.Running, true
+		case waitingMetricNames[base]:
+			target, foundWaiting = &activity.Waiting, true
+		default:
+			continue // not a metric this package reads
 		}
+
+		// Only a line that claims to BE one of our two metrics is validated
+		// this strictly — a malformed value here is treated as a hard failure
+		// rather than silently skipped, since skipping it would otherwise
+		// silently undercount exactly the signal the caller depends on.
+		value, err := strconv.ParseFloat(valueText, 64)
+		if err != nil {
+			return Activity{}, fmt.Errorf("%s: value %q is not a number: %w", base, valueText, err)
+		}
+
+		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+			return Activity{}, fmt.Errorf("%s reported %v: must be a finite, non-negative number", base, value)
+		}
+
+		*target += value
 	}
 
 	if err := scanner.Err(); err != nil {
 		return Activity{}, fmt.Errorf("parse metrics: %w", err)
 	}
 
-	// A response with neither metric name in it is far more likely malformed,
-	// truncated, or from the wrong endpoint than a vLLM instance that is
-	// genuinely and simultaneously idle on both signals forever — callers must
-	// not read a zero-value Activity here as "confirmed idle."
-	if !foundAnySample {
-		return Activity{}, fmt.Errorf("no %s or %s samples found in response: "+
-			"malformed body, wrong endpoint, or an unrecognized vLLM metrics format", runningMetric, waitingMetric)
+	switch {
+	case !foundRunning && !foundWaiting:
+		return Activity{}, fmt.Errorf(
+			"neither num_requests_running nor num_requests_waiting found in response: "+
+				"malformed body, wrong endpoint, or an unrecognized vLLM metrics format (checked names: %v, %v)",
+			keys(runningMetricNames), keys(waitingMetricNames))
+	case !foundRunning:
+		return Activity{}, fmt.Errorf(
+			"num_requests_running not found in response though num_requests_waiting was: "+
+				"refusing to treat the missing signal as zero (checked names: %v)", keys(runningMetricNames))
+	case !foundWaiting:
+		return Activity{}, fmt.Errorf(
+			"num_requests_waiting not found in response though num_requests_running was: "+
+				"refusing to treat the missing signal as zero (checked names: %v)", keys(waitingMetricNames))
 	}
 
 	return activity, nil
 }
 
 // splitSample splits a single exposition-format line into its metric name
-// (including any label block, so callers can substring-match on the base
-// name) and its trailing float value.
-func splitSample(line string) (name string, value float64, ok bool) {
+// (including any label block) and the raw text of its trailing value,
+// without parsing that value yet — callers decide how strictly to validate it
+// depending on whether the name matched something they care about.
+func splitSample(line string) (name string, valueText string, ok bool) {
 	lastSpace := strings.LastIndexByte(line, ' ')
 	if lastSpace < 0 {
-		return "", 0, false
+		return "", "", false
 	}
 
-	v, err := strconv.ParseFloat(line[lastSpace+1:], 64)
-	if err != nil {
-		return "", 0, false
+	return line[:lastSpace], line[lastSpace+1:], true
+}
+
+// baseMetricName strips a Prometheus label block ("{...}") off a metric name,
+// so "vllm:num_requests_running{model_name=\"a\"}" compares equal to
+// "vllm:num_requests_running".
+func baseMetricName(name string) string {
+	if i := strings.IndexByte(name, '{'); i >= 0 {
+		return name[:i]
 	}
 
-	return line[:lastSpace], v, true
+	return name
+}
+
+func keys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+
+	return out
 }

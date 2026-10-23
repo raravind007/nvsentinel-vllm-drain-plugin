@@ -1,4 +1,4 @@
-module github.com/example/vllm-drain-plugin
+module github.com/raravind007/nvsentinel-vllm-drain-plugin
 
 go 1.26.0
 

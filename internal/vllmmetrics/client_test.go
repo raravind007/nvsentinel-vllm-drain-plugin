@@ -110,6 +110,66 @@ func TestFetchMalformedBodyIsAnErrorNotIdle(t *testing.T) {
 	}
 }
 
+func TestFetchOnlyRunningMetricPresentIsAnError(t *testing.T) {
+	// A vLLM version that renamed or dropped just num_requests_waiting must not
+	// have that silently read as "zero waiting requests" — both signals are
+	// required, not either one.
+	host, port := serve(t, "vllm:num_requests_running 0\n")
+
+	_, err := NewClient(port, "/metrics", time.Second).Fetch(context.Background(), host)
+	if err == nil {
+		t.Fatal("Fetch succeeded with num_requests_waiting entirely absent, want an error")
+	}
+}
+
+func TestFetchOnlyWaitingMetricPresentIsAnError(t *testing.T) {
+	host, port := serve(t, "vllm:num_requests_waiting 0\n")
+
+	_, err := NewClient(port, "/metrics", time.Second).Fetch(context.Background(), host)
+	if err == nil {
+		t.Fatal("Fetch succeeded with num_requests_running entirely absent, want an error")
+	}
+}
+
+func TestFetchNegativeValueIsAnError(t *testing.T) {
+	// An in-flight request count can never legitimately be negative; a negative
+	// reading means the response is corrupted, not that activity is "very idle."
+	host, port := serve(t, "vllm:num_requests_running -1\nvllm:num_requests_waiting 0\n")
+
+	_, err := NewClient(port, "/metrics", time.Second).Fetch(context.Background(), host)
+	if err == nil {
+		t.Fatal("Fetch succeeded with a negative sample, want an error")
+	}
+}
+
+func TestFetchNonFiniteValueIsAnError(t *testing.T) {
+	for _, value := range []string{"NaN", "+Inf", "-Inf"} {
+		t.Run(value, func(t *testing.T) {
+			host, port := serve(t, fmt.Sprintf("vllm:num_requests_running %s\nvllm:num_requests_waiting 0\n", value))
+
+			_, err := NewClient(port, "/metrics", time.Second).Fetch(context.Background(), host)
+			if err == nil {
+				t.Fatalf("Fetch succeeded with running=%s, want an error", value)
+			}
+		})
+	}
+}
+
+func TestFetchDoesNotMatchAnUnrelatedMetricWithSimilarName(t *testing.T) {
+	// Exact-name matching (post label-stripping), not substring containment: a
+	// metric that merely contains "num_requests_running" as part of a longer,
+	// unrelated name must not be mistaken for the real signal.
+	body := "vllm:num_requests_running_lora_adapters_total 999\nvllm:num_requests_waiting 0\n"
+
+	host, port := serve(t, body)
+
+	_, err := NewClient(port, "/metrics", time.Second).Fetch(context.Background(), host)
+	if err == nil {
+		t.Fatal("Fetch succeeded treating a similarly-named metric as num_requests_running, " +
+			"want an error since the real metric is still absent")
+	}
+}
+
 func TestFetchUnreachablePodIsAnError(t *testing.T) {
 	// Port 1 on loopback: nothing listens there, standing in for a pod that
 	// has gone away or hasn't opened its metrics port yet. Callers must treat

@@ -31,9 +31,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	nvsentinelv1alpha1 "github.com/example/vllm-drain-plugin/api/v1alpha1"
-	"github.com/example/vllm-drain-plugin/internal/quiesce"
-	"github.com/example/vllm-drain-plugin/internal/vllmmetrics"
+	nvsentinelv1alpha1 "github.com/raravind007/nvsentinel-vllm-drain-plugin/api/v1alpha1"
+	"github.com/raravind007/nvsentinel-vllm-drain-plugin/internal/quiesce"
+	"github.com/raravind007/nvsentinel-vllm-drain-plugin/internal/vllmmetrics"
 )
 
 // node-drainer polls for this exact condition; it MUST match the

@@ -34,8 +34,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	nvsentinelv1alpha1 "github.com/example/vllm-drain-plugin/api/v1alpha1"
-	"github.com/example/vllm-drain-plugin/internal/quiesce"
+	nvsentinelv1alpha1 "github.com/raravind007/nvsentinel-vllm-drain-plugin/api/v1alpha1"
+	"github.com/raravind007/nvsentinel-vllm-drain-plugin/internal/quiesce"
 )
 
 // This suite exercises the four scenarios the reference plugin is expected to

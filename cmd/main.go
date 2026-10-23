@@ -35,8 +35,8 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	nvsentinelv1alpha1 "github.com/example/vllm-drain-plugin/api/v1alpha1"
-	"github.com/example/vllm-drain-plugin/internal/controller"
+	nvsentinelv1alpha1 "github.com/raravind007/nvsentinel-vllm-drain-plugin/api/v1alpha1"
+	"github.com/raravind007/nvsentinel-vllm-drain-plugin/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
 

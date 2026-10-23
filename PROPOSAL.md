@@ -1,7 +1,6 @@
 # Proposal: Reference vLLM Inference-Aware Drain Plugin (using the existing `customDrain` extension point)
 
 > Drafted for an upstream GitHub issue against [NVIDIA/NVSentinel](https://github.com/NVIDIA/NVSentinel).
-> Replace the `[link]` placeholder below with this repository's public URL before posting.
 
 ## Motivation
 
@@ -21,7 +20,9 @@ extension point, specifically for vLLM, that could serve as a template for other
 
 ## Design
 
-Working reference implementation: `[link]`. On each `DrainRequest`, the plugin:
+Working reference implementation:
+[github.com/raravind007/nvsentinel-vllm-drain-plugin](https://github.com/raravind007/nvsentinel-vllm-drain-plugin).
+On each `DrainRequest`, the plugin:
 
 1. **Stops routing new requests** by patching a `nvsentinel.nvidia.com/drain-ready` condition directly
    onto the pod's `/status` subresource. This relies on the pod declaring it as a

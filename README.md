@@ -97,6 +97,73 @@ renders as expected against the `NVSentinel` version you're actually running**, 
 unrendered field as `false` (non-fatal) — which is what the Go zero value already gives you by
 default, not a change you need to make.
 
+### Native vLLM shutdown: configure this alongside the plugin, not instead of it
+
+vLLM has its own first-party graceful-shutdown support: the `--shutdown-timeout` flag (merged in
+[vllm-project/vllm#34730](https://github.com/vllm-project/vllm/pull/34730), default `0` = abort
+immediately). On `SIGTERM`, vLLM stops accepting new requests immediately regardless of the flag, and
+with `--shutdown-timeout=N` set, waits up to `N` seconds for in-flight requests to finish before the
+process exits — exiting early if they finish sooner. Upstream guidance on wiring this into Kubernetes
+is still incomplete: an RFC on broader shutdown semantics
+([#24885](https://github.com/vllm-project/vllm/issues/24885)) and a docs PR adding this to vLLM's own
+Kubernetes deployment guide ([#43208](https://github.com/vllm-project/vllm/pull/43208), approved but
+closed stale) didn't land. The [llm-d project](https://llm-d.ai/docs/dev/operations/graceful-shutdown)
+documents the concrete pattern this plugin's deployment example follows — see
+[`deploy/vllm-workload/readiness-gate-init-example.yaml`](deploy/vllm-workload/readiness-gate-init-example.yaml).
+
+**This plugin does not replace `--shutdown-timeout`; configure both.** The plugin decides *when* it's
+safe to start terminating a pod at all (dynamically, from observed `/metrics` activity, and from
+NVSentinel's own fault-severity signal) — `--shutdown-timeout` then governs what vLLM itself does
+*after* that termination has already started. They operate on different phases of the same timeline,
+not as alternatives:
+
+```
+Plugin quiesces (QUIESCE_DEADLINE) → Eviction issued → preStop hook → SIGTERM →
+vLLM's own --shutdown-timeout window → pod exits → plugin observes it gone → DrainComplete=True
+```
+
+**A fatal health event (`isFatal=true`) skips this entire chain.** `forceDrain` deletes the pod
+directly with `FORCE_DELETE_GRACE_PERIOD_SECONDS` (default `0`), bypassing preStop, `SIGTERM`
+grace, and `--shutdown-timeout` entirely — a fatal GPU fault may mean there is no healthy process left
+to gracefully finish anything, regardless of how well the shutdown chain above is configured.
+
+**Sizing `customDrain.timeout` requires the whole chain above, not just this plugin's own settings.**
+`complete()` only reports `DrainComplete=True` once the pod has actually disappeared — not once
+eviction is merely requested — so for the graceful path the full elapsed time is `QUIESCE_DEADLINE`
+(worst case) **plus** the pod's own `terminationGracePeriodSeconds` (which must itself exceed the
+preStop delay plus `--shutdown-timeout`, per llm-d's guidance), plus margin for API latency and this
+plugin's own poll interval. A worked example with internally consistent numbers:
+
+| Setting | Where it's configured | Example |
+|---|---|---|
+| Plugin quiesce deadline | this plugin, `QUIESCE_DEADLINE` | 120s |
+| Kubernetes `preStop` delay | vLLM pod spec | 10s |
+| vLLM `--shutdown-timeout` | vLLM container args | 60s |
+| Pod `terminationGracePeriodSeconds` | vLLM pod spec | 90s (> 10s + 60s, with margin) |
+| node-drainer `customDrain.timeout` | NVSentinel Helm values | 300s (> 120s + 90s, with margin) |
+
+See [`deploy/node-drainer-wiring/node-drainer-values.yaml`](deploy/node-drainer-wiring/node-drainer-values.yaml)
+for this same example wired into actual Helm values.
+
+**Validate this against your actual vLLM version and cluster before relying on it** — the numbers
+above are a worked example, not a certified default, and nothing in this reference implementation's
+test suite exercises a live vLLM process:
+
+- Confirm `--shutdown-timeout` exists on the vLLM version you're deploying (merged v0.18.0+, but had
+  a revert/reapply cycle upstream — check your version's `vllm serve --help`).
+- Confirm the container actually receives `SIGTERM` — exec into a test pod during a drain and check
+  vLLM's logs for a shutdown message, or that it's still `sh`, not `vllm`, as PID 1 (`ps -p 1`).
+- Confirm `terminationGracePeriodSeconds` on the real pod spec, not just the Deployment template
+  (`kubectl get pod <pod> -o jsonpath='{.spec.terminationGracePeriodSeconds}'`), actually exceeds your
+  chosen preStop delay plus `--shutdown-timeout`.
+- Load-test a drain against a pod with a genuinely long-running or streaming request in flight, and
+  confirm it completes rather than being cut off — this is the scenario the whole chain exists for.
+
+Finally: none of this closes the gap already noted under "Stop routing" above — a readiness change is
+not an instantaneous guarantee against new requests arriving over an existing connection or through a
+routing layer that doesn't react to pod readiness. `--shutdown-timeout` and this plugin both reduce how
+often that race matters; neither eliminates it.
+
 See [`internal/controller/drainrequest_controller.go`](internal/controller/drainrequest_controller.go)
 for the full reconcile logic and [`internal/controller/config.go`](internal/controller/config.go) for
 every tunable (`QUIESCE_DEADLINE`, `POLL_INTERVAL`, `CONFIRM_WINDOW`, `VLLM_METRICS_PORT`/`PATH`,
@@ -120,11 +187,14 @@ for how to drive it end-to-end with a real injected GPU fault.
 - **A drain abandoned mid-flight leaves the pod not-ready.** If a `DrainRequest` stops being reconciled
   toward completion (e.g. node-drainer deletes it without the pod ever being evicted), nothing resets
   `drain-ready` back to True — see the residual-gap note in the deployment example above.
-- **`node-drainer`'s own `customDrain.timeout` must be configured larger than this plugin's worst-case
-  runtime**, i.e. larger than `QUIESCE_DEADLINE` plus however long a forced deletion with
-  `FORCE_DELETE_GRACE_PERIOD_SECONDS` plus normal API latency takes — otherwise node-drainer can give
-  up waiting on the `DrainRequest` before this plugin's own forced-drain fallback finishes. See
-  [`deploy/node-drainer-wiring/node-drainer-values.yaml`](deploy/node-drainer-wiring/node-drainer-values.yaml).
+- **`node-drainer`'s own `customDrain.timeout` must cover this plugin's full worst-case runtime,
+  including the pod's own shutdown chain** — not just `QUIESCE_DEADLINE` plus the forced-deletion
+  path's `FORCE_DELETE_GRACE_PERIOD_SECONDS`. For the graceful path specifically, the dominant term is
+  usually the pod's `terminationGracePeriodSeconds` (covering preStop + `SIGTERM` + vLLM's own
+  `--shutdown-timeout`), not the forced-deletion grace period. See "Native vLLM shutdown" above for the
+  full chain and a worked example, and
+  [`deploy/node-drainer-wiring/node-drainer-values.yaml`](deploy/node-drainer-wiring/node-drainer-values.yaml)
+  for the same example in Helm values.
 - The quiesce deadline currently applies uniformly to every pod in a `DrainRequest`; a mixed batch
   of a 2-second and a 90-second request both drain against the same clock.
 - `FATAL_ERROR_CODES` is a flat string set; it doesn't distinguish which GPU a multi-GPU pod actually

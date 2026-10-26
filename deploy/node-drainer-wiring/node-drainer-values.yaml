@@ -23,13 +23,16 @@ node-drainer:
     resource: "drainrequests"
     statusConditionType: "DrainComplete"
     statusConditionStatus: "True"
-    # MUST exceed the plugin's own worst-case runtime, or node-drainer gives up
-    # waiting on the DrainRequest before the plugin's forced-drain fallback
-    # finishes. Worst case here is QUIESCE_DEADLINE (120s, the plugin's
-    # default) + FORCE_DELETE_GRACE_PERIOD_SECONDS (0s default) + margin for
-    # API latency and the plugin's own poll interval — this value must be kept
-    # in sync by hand if either of those defaults changes. node-drainer's own
-    # timeout is a backstop for the plugin becoming unresponsive, not the
-    # mechanism bounding how long a graceful drain waits for in-flight
-    # requests; that's QUIESCE_DEADLINE, enforced inside the plugin.
-    timeout: "180"
+    # MUST exceed the plugin's full worst-case runtime, or node-drainer gives up
+    # waiting on the DrainRequest before the plugin finishes. The plugin only
+    # reports DrainComplete once the pod has actually disappeared — for the
+    # graceful path that's QUIESCE_DEADLINE (120s, the plugin's default) PLUS
+    # the pod's own terminationGracePeriodSeconds (90s in this example: see
+    # README.md's "Native vLLM shutdown" section — it must itself exceed the
+    # preStop delay + vLLM's --shutdown-timeout), plus margin for API latency
+    # and the plugin's own poll interval. 120 + 90 = 210; 300 leaves ~90s of
+    # margin. This is NOT QUIESCE_DEADLINE + FORCE_DELETE_GRACE_PERIOD_SECONDS
+    # (the forced path, usually the smaller of the two) — size this against
+    # whichever path is actually slower for your configuration, and keep it in
+    # sync by hand if QUIESCE_DEADLINE or terminationGracePeriodSeconds change.
+    timeout: "300"

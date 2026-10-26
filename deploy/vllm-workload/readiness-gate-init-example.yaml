@@ -23,6 +23,13 @@
 # it needs. Add the initContainer and the readinessGate to the SAME Deployment
 # — adding one without the other either does nothing (no gate) or makes every
 # pod permanently unready (gate with no initializer).
+#
+# The Deployment template below also wires up vLLM's own native graceful
+# shutdown (--shutdown-timeout, a preStop delay, and a terminationGracePeriodSeconds
+# sized to cover both) alongside the readiness gate — see README.md's "Native
+# vLLM shutdown" section for why this plugin needs both, not one or the other,
+# and for the full timeline and timeout-sizing formula this example's numbers
+# satisfy.
 
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -93,9 +100,32 @@ subjects:
 #               valueFrom: { fieldRef: { fieldPath: metadata.name } }
 #             - name: POD_NAMESPACE
 #               valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+#       # terminationGracePeriodSeconds must exceed the preStop sleep below plus
+#       # vLLM's own --shutdown-timeout, with margin — 10 + 60 = 70; 90 leaves
+#       # 20s. Too short and kubelet SIGKILLs vLLM before --shutdown-timeout's
+#       # own window elapses, silently truncating the in-flight requests it was
+#       # configured to let finish.
+#       terminationGracePeriodSeconds: 90
 #       containers:
 #         - name: vllm
-#           # ... your existing vLLM container spec, unchanged ...
+#           # `exec` is required here, not a side note: launching via a plain
+#           # `sh -c "vllm serve ..."` makes the shell PID 1, and shells do not
+#           # forward SIGTERM to child processes by default — vLLM would never
+#           # see the signal at all, --shutdown-timeout or not. `exec` replaces
+#           # the shell with the vllm process so it receives SIGTERM directly.
+#           command: ["/bin/sh", "-c"]
+#           args:
+#             - exec vllm serve $MODEL --shutdown-timeout 60
+#           lifecycle:
+#             preStop:
+#               exec:
+#                 # Gives the endpoint controller/kube-proxy time to actually
+#                 # propagate this pod's removal from Service routing before
+#                 # SIGTERM starts vLLM's own --shutdown-timeout clock — without
+#                 # this, a request can still land here in the moment the
+#                 # --shutdown-timeout window has already started.
+#                 command: ["sleep", "10"]
+#           # ... the rest of your existing vLLM container spec, unchanged ...
 #
 # This runs once per pod (initContainers do not re-run on a main-container
 # restart/crash-loop, only when the Pod object itself is recreated), so the
